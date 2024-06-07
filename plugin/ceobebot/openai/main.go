@@ -6,6 +6,7 @@ import (
 	"github.com/alioth-center/infrastructure/logger"
 	"github.com/alioth-center/infrastructure/thirdparty/openai"
 	"github.com/alioth-center/infrastructure/trace"
+	"github.com/alioth-center/infrastructure/utils/values"
 	zero "github.com/wdvxdr1123/ZeroBot"
 	"github.com/wdvxdr1123/ZeroBot/message"
 )
@@ -50,10 +51,11 @@ func (m Agent) HandleFunc(ctx *zero.Ctx) {
 		return
 	}
 
+	requestMessage := values.BuildStrings("发送人:", ctx.Event.Sender.NickName, "询问信息:", ctx.ExtractPlainText())
 	res, err := client.CompleteChat(openai.CompleteChatRequest{
 		Body: openai.CompleteChatRequestBody{
 			Model:     cfg.Model,
-			Messages:  []openai.ChatMessageObject{{Role: "system", Content: cfg.Prompt}, {Role: "user", Content: ctx.ExtractPlainText()}},
+			Messages:  []openai.ChatMessageObject{{Role: "system", Content: cfg.Prompt}, {Role: "user", Content: requestMessage}},
 			N:         1,
 			MaxTokens: 1500,
 		},

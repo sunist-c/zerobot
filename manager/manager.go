@@ -1,12 +1,14 @@
 package manager
 
 import (
+	"context"
 	"embed"
 	ctrl "github.com/FloatTech/zbpctrl"
 	"github.com/FloatTech/zbputils/control"
 	"github.com/FloatTech/zbputils/ctxext"
 	"github.com/alioth-center/infrastructure/config"
 	"github.com/alioth-center/infrastructure/logger"
+	"github.com/alioth-center/infrastructure/trace"
 	"github.com/alioth-center/infrastructure/utils/concurrency"
 	zero "github.com/wdvxdr1123/ZeroBot"
 	"github.com/wdvxdr1123/ZeroBot/extension/rate"
@@ -19,7 +21,7 @@ var (
 	embeddingConfig embed.FS
 
 	manager = &pluginManager{
-		handlers:    concurrency.NewHashMap[string, zero.Handler](concurrency.HashMapNodeOptionSmallSize),
+		handlers:    concurrency.NewHashMap[string, Handler](concurrency.HashMapNodeOptionSmallSize),
 		middlewares: concurrency.NewHashMap[string, zero.Rule](concurrency.HashMapNodeOptionSmallSize),
 		groups:      concurrency.NewHashMap[string, *HandlerMiddlewareMetadata](concurrency.HashMapNodeOptionSmallSize),
 	}
@@ -36,44 +38,42 @@ func Default() Manager {
 }
 
 func Initialize(externalConfig string) {
-	if logging == nil {
-		SetLogger(logger.Default())
-	}
+	ctx := trace.NewContext()
 
 	// read embedding config
 	var yamlConfig, jsonConfig ManagedConfig
 	yamlReadErr, jsonReadErr :=
-		config.LoadEmbedConfig(&yamlConfig, embeddingConfig, "embeddings/config.yaml"),
-		config.LoadEmbedConfig(&jsonConfig, embeddingConfig, "embeddings/config.json")
+		config.LoadEmbedConfig(&yamlConfig, embeddingConfig, "embedding/config.yaml"),
+		config.LoadEmbedConfig(&jsonConfig, embeddingConfig, "embedding/config.json")
 	if yamlReadErr != nil && jsonReadErr != nil {
-		logging.Info(logger.NewFields().WithMessage("failed to read embedding config").WithData(map[string]string{"yaml": yamlReadErr.Error(), "json": jsonReadErr.Error()}))
+		logging.Info(logger.NewFields(ctx).WithMessage("failed to read embedding config").WithData(map[string]string{"yaml": yamlReadErr.Error(), "json": jsonReadErr.Error()}))
 	}
 
 	// read external config
 	var external ManagedConfig
 	externalReadErr := config.LoadConfig(&external, externalConfig)
 	if externalReadErr != nil {
-		logging.Error(logger.NewFields().WithMessage("failed to read external config").WithData(map[string]string{"path": externalConfig, "error": externalReadErr.Error()}))
+		logging.Error(logger.NewFields(ctx).WithMessage("failed to read external config").WithData(map[string]string{"path": externalConfig, "error": externalReadErr.Error()}))
 	}
 
 	// merge configs
-	manager.InitializeManagedPlugins(&yamlConfig)
-	manager.InitializeManagedPlugins(&jsonConfig)
-	manager.InitializeManagedPlugins(&external)
+	manager.InitializeManagedPlugins(ctx, &yamlConfig)
+	manager.InitializeManagedPlugins(ctx, &jsonConfig)
+	manager.InitializeManagedPlugins(ctx, &external)
 }
 
 type Manager interface {
-	RegisterHandler(name string, handler zero.Handler)
+	RegisterHandler(name string, handler Handler)
 	RegisterMiddleware(name string, middleware zero.Rule)
 }
 
 type pluginManager struct {
-	handlers    concurrency.Map[string, zero.Handler]
+	handlers    concurrency.Map[string, Handler]
 	middlewares concurrency.Map[string, zero.Rule]
 	groups      concurrency.Map[string, *HandlerMiddlewareMetadata]
 }
 
-func (p *pluginManager) RegisterHandler(name string, handler zero.Handler) {
+func (p *pluginManager) RegisterHandler(name string, handler Handler) {
 	p.handlers.Set(name, handler)
 }
 
@@ -81,15 +81,16 @@ func (p *pluginManager) RegisterMiddleware(name string, middleware zero.Rule) {
 	p.middlewares.Set(name, middleware)
 }
 
-func (p *pluginManager) InitializeManagedPlugins(conf *ManagedConfig) {
+func (p *pluginManager) InitializeManagedPlugins(ctx context.Context, conf *ManagedConfig) {
 	p.parseGroups(conf.Groups)
 
+	logging.Info(logger.NewFields(ctx).WithMessage("total plugins to initialize").WithData(len(conf.Plugins)))
 	for _, plugin := range conf.Plugins {
 		if !plugin.Enable || len(plugin.Handlers) == 0 {
 			continue
 		}
 
-		endpoints := map[string]zero.Handler{}
+		endpoints := map[string]Handler{}
 		for _, handler := range plugin.Handlers {
 			impl, got := p.handlers.Get(handler.HandlerName)
 			if got && impl != nil {
@@ -100,7 +101,7 @@ func (p *pluginManager) InitializeManagedPlugins(conf *ManagedConfig) {
 			continue
 		}
 
-		engine := control.AutoRegister(&ctrl.Options[*zero.Ctx]{
+		engine := control.Register(plugin.Name, &ctrl.Options[*zero.Ctx]{
 			DisableOnDefault:  false,
 			Brief:             plugin.Description,
 			Help:              plugin.Help,
@@ -113,7 +114,8 @@ func (p *pluginManager) InitializeManagedPlugins(conf *ManagedConfig) {
 
 		pluginPreHandlers, pluginMidHandlers := p.getGroupPreHandlers(plugin.Group), p.getGroupMidHandlers(plugin.Group)
 		for _, handler := range plugin.Handlers {
-			if endpoints[handler.HandlerName] == nil {
+			handlerImpl := endpoints[handler.HandlerName]
+			if handlerImpl == nil {
 				continue
 			}
 
@@ -133,29 +135,29 @@ func (p *pluginManager) InitializeManagedPlugins(conf *ManagedConfig) {
 
 			// process triggers
 			if len(handler.Triggers.FullMatches) > 0 {
-				p.attachMatcher(engine.OnFullMatchGroup(handler.Triggers.FullMatches), handler).Handle(endpoints[handler.HandlerName])
+				p.attachMatcher(engine.OnFullMatchGroup(handler.Triggers.FullMatches, handlerImpl.AttachRules()...), handler, handlerImpl).Handle(handlerImpl.HandleFunc)
 			}
 			if len(handler.Triggers.Keywords) > 0 {
-				p.attachMatcher(engine.OnKeywordGroup(handler.Triggers.Keywords), handler).Handle(endpoints[handler.HandlerName])
+				p.attachMatcher(engine.OnKeywordGroup(handler.Triggers.Keywords, handlerImpl.AttachRules()...), handler, handlerImpl).Handle(handlerImpl.HandleFunc)
 			}
 			if len(handler.Triggers.Commands) > 0 {
-				p.attachMatcher(engine.OnCommandGroup(handler.Triggers.Commands), handler).Handle(endpoints[handler.HandlerName])
+				p.attachMatcher(engine.OnCommandGroup(handler.Triggers.Commands, handlerImpl.AttachRules()...), handler, handlerImpl).Handle(handlerImpl.HandleFunc)
 			}
 			if len(handler.Triggers.Prefixes) > 0 {
-				p.attachMatcher(engine.OnPrefixGroup(handler.Triggers.Prefixes), handler).Handle(endpoints[handler.HandlerName])
+				p.attachMatcher(engine.OnPrefixGroup(handler.Triggers.Prefixes, handlerImpl.AttachRules()...), handler, handlerImpl).Handle(handlerImpl.HandleFunc)
 			}
 			if len(handler.Triggers.Suffixes) > 0 {
-				p.attachMatcher(engine.OnSuffixGroup(handler.Triggers.Suffixes), handler).Handle(endpoints[handler.HandlerName])
+				p.attachMatcher(engine.OnSuffixGroup(handler.Triggers.Suffixes, handlerImpl.AttachRules()...), handler, handlerImpl).Handle(handlerImpl.HandleFunc)
 			}
 			for _, regex := range handler.Triggers.Regexes {
-				p.attachMatcher(engine.OnRegex(regex), handler).Handle(endpoints[handler.HandlerName])
+				p.attachMatcher(engine.OnRegex(regex, handlerImpl.AttachRules()...), handler, handlerImpl).Handle(handlerImpl.HandleFunc)
 			}
 			if handler.Triggers.Notice {
-				p.attachMatcher(engine.OnNotice(), handler).Handle(endpoints[handler.HandlerName])
+				p.attachMatcher(engine.OnNotice(handlerImpl.AttachRules()...), handler, handlerImpl).Handle(handlerImpl.HandleFunc)
 			}
 
 			// logging initialization
-			logging.Info(logger.NewFields().WithMessage("plugin initialized").WithData(map[string]any{"name": plugin.Name, "handler": handler.HandlerName, "metadata": handler}))
+			logging.Info(logger.NewFields(ctx).WithMessage("plugin initialized").WithData(map[string]any{"name": plugin.Name, "handler": handler.HandlerName, "metadata": handler}))
 		}
 	}
 }
@@ -226,10 +228,48 @@ func (p *pluginManager) parseLimiter(limiter string) (need bool, result func(*ze
 	}
 }
 
-func (p *pluginManager) attachMatcher(matcher *control.Matcher, metadata HandlerMetadata) *control.Matcher {
+func (p *pluginManager) attachMatcher(matcher *control.Matcher, metadata HandlerMetadata, handler Handler) *control.Matcher {
 	if limited, limiter := p.parseLimiter(metadata.Limiter); limited {
-		return matcher.Limit(limiter).SetBlock(metadata.Blocked)
+		return handler.AttachMatchers(matcher.Limit(limiter).SetBlock(metadata.Blocked))
 	}
 
-	return matcher.SetBlock(metadata.Blocked)
+	return handler.AttachMatchers(matcher.SetBlock(metadata.Blocked))
+}
+
+type Handler interface {
+	HandleFunc(ctx *zero.Ctx)
+	AttachMatchers(origin *control.Matcher) (result *control.Matcher)
+	AttachRules() []zero.Rule
+}
+
+type baseHandler func(ctx *zero.Ctx)
+
+func (b baseHandler) HandleFunc(ctx *zero.Ctx) {
+	b(ctx)
+}
+
+func (b baseHandler) AttachMatchers(origin *control.Matcher) (result *control.Matcher) {
+	return origin
+}
+
+func (b baseHandler) AttachRules() []zero.Rule {
+	return []zero.Rule{}
+}
+
+func NewHandler(handler func(ctx *zero.Ctx)) Handler {
+	return baseHandler(handler)
+}
+
+type BaseHandler struct{}
+
+func (b BaseHandler) HandleFunc(ctx *zero.Ctx) {
+	panic("implement me")
+}
+
+func (b BaseHandler) AttachMatchers(origin *control.Matcher) (result *control.Matcher) {
+	return origin
+}
+
+func (b BaseHandler) AttachRules() []zero.Rule {
+	return []zero.Rule{}
 }

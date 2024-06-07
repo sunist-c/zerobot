@@ -7,24 +7,35 @@ import (
 )
 
 type ReceivedMessage struct {
-	ID   int64  `json:"id"`
-	Name string `json:"name"`
-	Text string `json:"text"`
+	ID    int64  `json:"id"`
+	Text  string `json:"text"`
+	Type  string `json:"type"`
+	Name  string `json:"name,omitempty"`
+	Group int64  `json:"group,omitempty"`
 }
 
-func LogMessage(log logger.Logger) func(ctx *zero.Ctx) bool {
-	if log == nil {
-		log = logging
-	}
-
+func LogMessage() func(ctx *zero.Ctx) bool {
 	return func(ctx *zero.Ctx) bool {
 		// just log the message to custom logger like loki/logrus/cls
-		log.Info(logger.NewFields().WithMessage("message received").WithData(&ReceivedMessage{
+		message := &ReceivedMessage{
 			ID:   ctx.Event.UserID,
-			Name: ctx.CardOrNickName(ctx.Event.UserID),
 			Text: ctx.ExtractPlainText(),
-		}))
+			Type: ctx.Event.MessageType,
+		}
+		switch message.Type {
+		case "group":
+			message.Group = ctx.Event.GroupID
+			message.Name = ctx.CardOrNickName(ctx.Event.UserID)
+		case "private":
+			message.Group = ctx.Event.UserID
+			message.Name = ctx.Event.Sender.Name()
+		}
 
+		if message.Text == "" {
+			message.Text = ctx.Event.Message.String()
+		}
+
+		logging.Info(logger.NewFields().WithMessage("message received").WithData(message))
 		return true
 	}
 }

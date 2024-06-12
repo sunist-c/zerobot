@@ -13,29 +13,26 @@ import (
 
 var (
 	client openai.Client
-	cfg    PublicConfig
+	cfg    OpenPlatformConfig
 )
 
-type PublicConfig struct {
+type OpenPlatformConfig struct {
 	Secret openai.Config      `yaml:"secret"`
 	Prompt string             `yaml:"prompt"`
 	Model  string             `yaml:"model"`
 	Price  map[string]float64 `yaml:"price"`
 }
 
-func lazyLoad() {
-	if client == nil {
+func init() {
+	manager.Default().RegisterHandler("openai-agent-handler", Agent{})
+	manager.InitBeforeServe(func() {
 		err := manager.GetYamlPublicConfig(&cfg, "openai_agent_configs")
 		if err != nil {
 			panic(err)
 		}
 
 		client = openai.NewClient(cfg.Secret, muteLogger{})
-	}
-}
-
-func init() {
-	manager.Default().RegisterHandler("openai-agent-handler", Agent{})
+	})
 }
 
 type Agent struct {
@@ -43,7 +40,6 @@ type Agent struct {
 }
 
 func (m Agent) HandleFunc(ctx *zero.Ctx) {
-	lazyLoad()
 	x := trace.NewContext()
 
 	if ctx.ExtractPlainText() == "" {

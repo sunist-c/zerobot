@@ -17,7 +17,7 @@ import (
 )
 
 var (
-	messageBuffer = make(chan *manager.ReceivedMessage, 100)
+	messageBuffer = make(chan *manager.ReceivedMessage, 200)
 	syncMutex     = sync.Mutex{}
 	signalIndex   = 0
 )
@@ -71,6 +71,8 @@ func bufferLog() {
 	for {
 		select {
 		case <-time.After(time.Hour):
+			// reset signal index every hour
+			signalIndex = 0
 			writeBuffer(0)
 		}
 	}

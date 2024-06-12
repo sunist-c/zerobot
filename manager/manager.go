@@ -24,6 +24,7 @@ var (
 		handlers:    concurrency.NewHashMap[string, Handler](concurrency.HashMapNodeOptionSmallSize),
 		middlewares: concurrency.NewHashMap[string, zero.Rule](concurrency.HashMapNodeOptionSmallSize),
 		groups:      concurrency.NewHashMap[string, *HandlerMiddlewareMetadata](concurrency.HashMapNodeOptionSmallSize),
+		inits:       []func(){},
 	}
 )
 
@@ -35,6 +36,10 @@ func SetLogger(log logger.Logger) {
 
 func Default() Manager {
 	return manager
+}
+
+func InitBeforeServe(f func()) {
+	manager.inits = append(manager.inits, f)
 }
 
 func Initialize(externalConfig string) {
@@ -56,6 +61,11 @@ func Initialize(externalConfig string) {
 		logging.Error(logger.NewFields(ctx).WithMessage("failed to read external config").WithData(map[string]string{"path": externalConfig, "error": externalReadErr.Error()}))
 	}
 
+	// init before serve
+	for _, fn := range manager.inits {
+		fn()
+	}
+
 	// merge configs
 	manager.InitializeManagedPlugins(ctx, &yamlConfig)
 	manager.InitializeManagedPlugins(ctx, &jsonConfig)
@@ -71,6 +81,7 @@ type pluginManager struct {
 	handlers    concurrency.Map[string, Handler]
 	middlewares concurrency.Map[string, zero.Rule]
 	groups      concurrency.Map[string, *HandlerMiddlewareMetadata]
+	inits       []func()
 }
 
 func (p *pluginManager) RegisterHandler(name string, handler Handler) {
